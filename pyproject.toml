@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "eveng-mcp-server"
+version = "0.1.0"
+description = "MCP server providing Claude/LLM agents with programmatic access to EVE-NG network labs"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Axiom Works AI", email = "hello@axiomworks.ai" },
+]
+keywords = ["mcp", "eve-ng", "network", "lab", "automation", "ai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx>=0.25.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "respx>=0.21",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+eveng-mcp-server = "eveng_mcp_server.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/axiom-works-ai/eveng-mcp-server"
+Repository = "https://github.com/axiom-works-ai/eveng-mcp-server"
+Issues = "https://github.com/axiom-works-ai/eveng-mcp-server/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eveng_mcp_server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RUF"]
