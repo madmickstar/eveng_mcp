@@ -6,9 +6,12 @@ register tools that wrap the :class:`EveNGClient` async HTTP client.
 Environment variables (all optional — defaults match the EVE-NG community
 edition out of the box):
 
-    EVENG_HOST      Base URL of the EVE-NG server (default ``http://192.168.122.10``)
-    EVENG_USERNAME  API username (default ``admin``)
-    EVENG_PASSWORD  API password (default ``eve``)
+    EVENG_HOST        Base URL of the EVE-NG server (default ``http://192.168.122.10``)
+    EVENG_USERNAME    API username (default ``admin``)
+    EVENG_PASSWORD    API password (default ``eve``)
+    EVENG_VERIFY_SSL  Verify the server's TLS certificate — ``true``/``false``
+                      (default ``false``, since EVE-NG typically runs a
+                      self-signed certificate out of the box)
 """
 
 from __future__ import annotations
@@ -17,10 +20,16 @@ import json
 import logging
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 
-from .client import EveNGClient, EveNGClientError
+from .client import (
+    EveNGClient,
+    EveNGClientError,
+    EveNGConsoleError,
+    telnet_send_commands,
+)
 from .models import AddNodeInput
 
 logger = logging.getLogger(__name__)
@@ -43,6 +52,20 @@ mcp = FastMCP(
 
 _client: EveNGClient | None = None
 
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean-ish environment variable.
+
+    Accepts ``1``/``0``, ``true``/``false``, ``yes``/``no``, ``on``/``off``
+    (case-insensitive). Falls back to ``default`` if the variable is unset.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUE_VALUES
+
 
 def _get_client() -> EveNGClient:
     """Return (and optionally create) the shared EVE-NG client."""
@@ -52,6 +75,7 @@ def _get_client() -> EveNGClient:
             base_url=os.environ.get("EVENG_HOST", "http://192.168.122.10"),
             username=os.environ.get("EVENG_USERNAME", "admin"),
             password=os.environ.get("EVENG_PASSWORD", "eve"),
+            verify_ssl=_env_bool("EVENG_VERIFY_SSL", default=False),
         )
     return _client
 
@@ -90,6 +114,78 @@ async def list_labs(folder: str = "/") -> str:
         return _fmt(labs)
     except EveNGClientError as exc:
         return f"Error listing labs: {exc}"
+
+
+async def _walk_folders(
+    client: EveNGClient,
+    folder: str,
+    _visited: set[str] | None = None,
+    _depth: int = 0,
+    _max_depth: int = 20,
+) -> dict[str, Any]:
+    """Recursively collect subfolders and labs starting at `folder`.
+
+    Guards against infinite recursion two ways, since EVE-NG's folder API
+    has been observed to include entries that resolve back to an already
+    visited path (e.g. a self- or parent-referencing entry), which without
+    a guard causes this to recurse forever and hang the tool call:
+
+    - `_visited`: normalized paths already walked in this call are never
+      walked again.
+    - `_max_depth`: a hard ceiling (default 20) as a second line of defense
+      in case of an unrecognized cycle shape.
+
+    Returns a nested dict: ``{"path": folder, "labs": [...], "folders": [_walk_folders(...), ...]}``.
+    """
+    if _visited is None:
+        _visited = set()
+
+    normalized = folder.rstrip("/") or "/"
+    if normalized in _visited or _depth > _max_depth:
+        return {"path": folder, "labs": [], "folders": [], "note": "skipped (cycle or depth limit)"}
+    _visited.add(normalized)
+
+    contents = await client.list_folder_contents(folder)
+    subfolders = []
+    for f in contents["folders"]:
+        # EVE-NG folder entries carry a "path" (or sometimes just "name")
+        name = f.get("name", "")
+        sub_path = f.get("path") or f"{folder.rstrip('/')}/{name}"
+        sub_normalized = sub_path.rstrip("/") or "/"
+        # Skip entries that don't actually descend (self/parent references)
+        if not name or sub_normalized == normalized:
+            continue
+        subfolders.append(
+            await _walk_folders(client, sub_path, _visited, _depth + 1, _max_depth)
+        )
+    return {
+        "path": folder,
+        "labs": contents["labs"],
+        "folders": subfolders,
+    }
+
+
+@mcp.tool(
+    name="list_all_labs",
+    description=(
+        "Recursively list every folder and lab on the EVE-NG server, starting "
+        "from a given folder (default the root '/'). Unlike 'list_labs', which "
+        "only shows labs directly inside one folder, this walks the full "
+        "directory tree and returns subfolders with their labs at every level."
+    ),
+)
+async def list_all_labs(folder: str = "/") -> str:
+    """Recursively list all folders and labs starting at `folder`.
+
+    Args:
+        folder: Folder path to start from (default ``/`` for the whole tree).
+    """
+    client = _get_client()
+    try:
+        tree = await _walk_folders(client, folder)
+        return _fmt(tree)
+    except EveNGClientError as exc:
+        return f"Error listing folders/labs: {exc}"
 
 
 @mcp.tool(
@@ -160,6 +256,31 @@ async def create_lab(
         return f"Lab '{name}' created successfully.\n{_fmt(result)}"
     except EveNGClientError as exc:
         return f"Error creating lab: {exc}"
+
+
+@mcp.tool(
+    name="edit_lab",
+    description=(
+        "Edit an existing lab's metadata — one field at a time (EVE-NG's API "
+        "only accepts a single field per edit request). Valid fields: name, "
+        "version, author, description, body."
+    ),
+)
+async def edit_lab(lab_path: str, field: str, value: str) -> str:
+    """Edit one metadata field on an existing lab.
+
+    Args:
+        lab_path: Full lab path (e.g. ``/My Lab.unl``).
+        field: Which field to change — one of ``name``, ``version``,
+            ``author``, ``description``, ``body``.
+        value: The new value for that field.
+    """
+    client = _get_client()
+    try:
+        result = await client.edit_lab(lab_path, **{field: value})
+        return f"Lab '{lab_path}' updated ({field}).\n{_fmt(result)}"
+    except (EveNGClientError, ValueError) as exc:
+        return f"Error editing lab: {exc}"
 
 
 @mcp.tool(
@@ -424,6 +545,76 @@ async def get_node_config(lab_path: str, node_id: int) -> str:
         return config
     except EveNGClientError as exc:
         return f"Error getting config for node {node_id}: {exc}"
+
+
+@mcp.tool(
+    name="list_interfaces",
+    description=(
+        "List all interfaces on a node, including which network (if any) "
+        "each interface is connected to.  Use this before 'connect_nodes' "
+        "to find free interface IDs, or to inspect existing connections."
+    ),
+)
+async def list_interfaces(lab_path: str, node_id: int) -> str:
+    """List a node's interfaces and their connection state.
+
+    Args:
+        lab_path: Full lab path.
+        node_id: Numeric node ID.
+    """
+    client = _get_client()
+    try:
+        interfaces = await client.list_interfaces(lab_path, node_id)
+        return _fmt(interfaces)
+    except EveNGClientError as exc:
+        return f"Error listing interfaces for node {node_id}: {exc}"
+
+
+@mcp.tool(
+    name="send_console_commands",
+    description=(
+        "Send a sequence of CLI commands to a node's console over telnet, "
+        "to configure a running device (VLANs, interfaces, hostnames, etc). "
+        "EVE-NG's REST API has no config-push endpoint, so this drives the "
+        "device's own CLI directly over its console port instead. The node "
+        "must already be started — use 'start_node' first if needed. "
+        "Include a persistence command such as 'write memory' as the last "
+        "command if the change should survive a reload."
+    ),
+)
+async def send_console_commands(
+    lab_path: str, node_id: int, commands: list[str]
+) -> str:
+    """Run CLI commands on a node via its telnet console.
+
+    Args:
+        lab_path: Full lab path.
+        node_id: Numeric node ID. The node must be running (its console URL
+            is only live once started).
+        commands: Ordered list of CLI lines to send, e.g. ``["enable",
+            "configure terminal", "vlan 20", " name testvlan", "exit",
+            "write memory"]``.
+    """
+    client = _get_client()
+    try:
+        node = await client.get_node(lab_path, node_id)
+    except EveNGClientError as exc:
+        return f"Error looking up node {node_id}: {exc}"
+
+    url = node.get("url", "") if isinstance(node, dict) else ""
+    parsed = urlparse(url)
+    if parsed.scheme != "telnet" or not parsed.hostname or not parsed.port:
+        return (
+            f"Node {node_id} has no active telnet console (url={url!r}). "
+            "Make sure the node is started."
+        )
+
+    try:
+        output = await telnet_send_commands(parsed.hostname, parsed.port, commands)
+    except EveNGConsoleError as exc:
+        return f"Error sending console commands to node {node_id}: {exc}"
+
+    return output or "(no console output captured)"
 
 
 # ---------------------------------------------------------------------------
